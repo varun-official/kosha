@@ -7,6 +7,9 @@ from langchain_mistralai.chat_models import ChatMistralAI
 from langchain_mistralai.embeddings import MistralAIEmbeddings
 from PyPDF2 import PdfReader
 from docx import Document
+import httpx
+import time
+from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -15,6 +18,10 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 load_dotenv()
 
 app = FastAPI()
+
+class QueryRequest(BaseModel):
+    query: str
+    top_k: int = 5
 
 # Initialize Mistral client
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
@@ -95,9 +102,22 @@ async def upload_file(file: UploadFile = File(...)):
 
     return {"message": "File processed successfully", "filename": file.filename}
 
-@app.get("/query")
-async def query_embeddings(query: str, top_k: int = 5):
-    query_embedding = embedding_model.embed_query(query)
+def handle_rate_limit(chain, query, context, retries=3, delay=5):
+    for attempt in range(retries):
+        try:
+            return chain.invoke({"query": query, "context": context})
+        except httpx.HTTPStatusError as e:
+            if "429" in str(e):  # Check if it's a rate limit error
+                if attempt < retries - 1:
+                    time.sleep(delay)
+                else:
+                    return "Rate limit exceeded. Please try again later."
+            else:
+                raise e  # Reraise non-rate limit errors
+
+@app.post("/query")
+async def query_embeddings(request: QueryRequest):
+    query_embedding = embedding_model.embed_query(request.query)
     
     conn = get_db_connection()
     cur = conn.cursor()
@@ -108,7 +128,7 @@ async def query_embeddings(query: str, top_k: int = 5):
         ORDER BY similarity DESC
         LIMIT %s
         """,
-        (np.array(query_embedding).tolist(), top_k),
+        (np.array(query_embedding).tolist(), request.top_k),
     )
     
     results = cur.fetchall()
@@ -124,21 +144,20 @@ async def query_embeddings(query: str, top_k: int = 5):
     - **Do not** use external knowledge or speculate.  
     - If the provided text does **not** contain relevant information, respond **only** with:  
       'I do not have any information about the query.'  
-    - **Only if an answer is found**, conclude with: (Source: doc_name, Page: page)  
+    - **Only if an answer is found**, conclude with: (Source: doc_name, Page: page) 
+    - Double check the answer before sending 
 
     Query: {query}  
 
     Below is the relevant content extracted from documents:  
     {context}"""),
 ])
-
-
     
     chain = prompt | llm
-    response = chain.invoke({"query": query, "context": context})
+    response = handle_rate_limit(chain, request.query, context)
     
     return {
-        "query": query,
+        "query": request.query,
         "response": response.content
     }
 
