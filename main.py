@@ -7,10 +7,14 @@ from langchain_mistralai.chat_models import ChatMistralAI
 from langchain_mistralai.embeddings import MistralAIEmbeddings
 from PyPDF2 import PdfReader
 from docx import Document
+import langchain.schema
 import httpx
 import time
+from langchain_community.vectorstores import PGVector
+from langchain.chains import RetrievalQA
 from pydantic import BaseModel
 from dotenv import load_dotenv
+import json
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
@@ -21,15 +25,16 @@ app = FastAPI()
 
 class QueryRequest(BaseModel):
     query: str
-    top_k: int = 5
+    top_k: int = 50
 
 # Initialize Mistral client
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+DB_CONN_STRING = os.getenv("DATABASE_CONNECTION_STRING")
 llm = ChatMistralAI(api_key=MISTRAL_API_KEY)
 
 # Database connection function
 def get_db_connection():
-    return psycopg2.connect(os.getenv("DATABASE_CONNECTION_STRING"))
+    return psycopg2.connect(DB_CONN_STRING)
 
 # Ensure pgvector extension is enabled and update schema
 def setup_database():
@@ -37,21 +42,12 @@ def setup_database():
     cur = conn.cursor()
     cur.execute("""
     CREATE EXTENSION IF NOT EXISTS vector;
-    CREATE TABLE IF NOT EXISTS document_embeddings (
-        id SERIAL PRIMARY KEY,
-        doc_name TEXT,
-        page INT,
-        chunk_index INT,  -- New field to track chunk order
-        text TEXT,
-        embedding VECTOR(1024)  -- Ensure this matches MistralAIEmbeddings
-    );
-
     """)
     conn.commit()
     cur.close()
     conn.close()
-
 setup_database()
+
 
 def split_text_into_chunks(text, chunk_size=400, chunk_overlap=50):
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
@@ -72,35 +68,40 @@ async def upload_file(file: UploadFile = File(...)):
             if page_text:
                 extracted_text.append((page_num, page_text))
     
-    # Extract text from DOCX
     elif file.filename.endswith(".docx"):
         doc = Document(file.file)
-        page_num = 1  # Assuming a single logical page for DOCX files
+        page_num = 1
         for para in doc.paragraphs:
-            extracted_text.append((page_num, para.text))
+            if para.text.strip():
+                extracted_text.append((page_num, para.text.strip()))
     else:
         raise HTTPException(status_code=400, detail="Unsupported file type. Upload a PDF or DOCX.")
 
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    # Process extracted text with chunking
+    # Prepare LangChain documents with metadata
+    all_chunks = []
     for page_num, page_text in extracted_text:
         cleaned_text = page_text.replace("\n", " ").strip()
         chunks = split_text_into_chunks(cleaned_text)
-
         for i, chunk in enumerate(chunks):
-            embedding = embedding_model.embed_query(chunk)
-            cur.execute(
-                "INSERT INTO document_embeddings (doc_name, page, chunk_index, text, embedding) VALUES (%s, %s, %s, %s, %s)",
-                (file.filename, page_num, i, chunk, np.array(embedding).tolist()),
-            )
+            all_chunks.append(langchain.schema.Document(
+                page_content=chunk,
+                metadata={
+                    "doc_name": file.filename,
+                    "page": page_num,
+                    "chunk_index": i
+                }
+            ))
 
-    conn.commit()
-    cur.close()
-    conn.close()
+    # Store using LangChain's PGVector
+    PGVector.from_documents(
+        documents=all_chunks,
+        embedding=embedding_model,
+        collection_name="document_embeddings",
+        connection_string=DB_CONN_STRING,
+    )
 
     return {"message": "File processed successfully", "filename": file.filename}
+
 
 def handle_rate_limit(chain, query, context, retries=3, delay=5):
     for attempt in range(retries):
@@ -117,48 +118,48 @@ def handle_rate_limit(chain, query, context, retries=3, delay=5):
 
 @app.post("/query")
 async def query_embeddings(request: QueryRequest):
-    query_embedding = embedding_model.embed_query(request.query)
-    
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT doc_name, page, text, 1 - (embedding <=> %s::vector) AS similarity
-        FROM document_embeddings
-        ORDER BY similarity DESC
-        LIMIT %s
-        """,
-        (np.array(query_embedding).tolist(), request.top_k),
+    # PGVector VectorStore
+    vectorstore = PGVector(
+        connection_string=DB_CONN_STRING,
+        collection_name="document_embeddings",
+        embedding_function=embedding_model
     )
-    
-    results = cur.fetchall()
-    cur.close()
-    conn.close()
-    
-    # Construct context for MistralAI using text content and document details
-    context = "\n".join([f"Document: {r[0]}, Page: {r[1]}\nContent: {r[2]}" for r in results])
 
-    prompt = ChatPromptTemplate.from_messages([
-    ("system", """You are an AI assistant that answers queries strictly based on the given documents.  
-    - **Only use** the provided content to generate responses.  
-    - **Do not** use external knowledge or speculate.  
-    - If the provided text does **not** contain relevant information, respond **only** with:  
-      'I do not have any information about the query.'  
-    - **Only if an answer is found**, conclude with: (Source: doc_name, Page: page) 
-    - Double check the answer before sending 
+    # Retriever
+    retriever = vectorstore.as_retriever(search_kwargs={"k": request.top_k})
 
-    Query: {query}  
+    # Custom prompt
+    custom_prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are an AI assistant that answers queries strictly based on the given documents.
+    - Only use the provided content to generate responses.
+    - Do not use external knowledge or speculate.
+    - If the provided text does not contain relevant information, respond only with:
+    'I do not have any information about the query.'
+    - Only if an answer is found, conclude with: (Source: doc_name, Page: page)
+    - Double check the answer before sending
 
-    Below is the relevant content extracted from documents:  
-    {context}"""),
-])
-    
-    chain = prompt | llm
-    response = handle_rate_limit(chain, request.query, context)
+    Query: {question}
+
+    Below is the relevant content extracted from documents:
+    {context}
+    """)
+    ])
+
+    # QA Chain
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=llm,
+        retriever=retriever,
+        chain_type="stuff",
+        chain_type_kwargs={"prompt": custom_prompt},
+        verbose=True,
+        return_source_documents=True
+    )
+
+    result = qa_chain({"query": request.query})
     
     return {
         "query": request.query,
-        "response": response.content
+        "response": result["result"]
     }
 
 if __name__ == "__main__":
