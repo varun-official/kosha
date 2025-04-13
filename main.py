@@ -25,7 +25,7 @@ app = FastAPI()
 
 class QueryRequest(BaseModel):
     query: str
-    top_k: int = 50
+    top_k: int = 5
 
 # Initialize Mistral client
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
@@ -103,10 +103,10 @@ async def upload_file(file: UploadFile = File(...)):
     return {"message": "File processed successfully", "filename": file.filename}
 
 
-def handle_rate_limit(chain, query, context, retries=3, delay=5):
+def query_from_retrievalqa(qa_chain,query, retries=3, delay=5):
     for attempt in range(retries):
         try:
-            return chain.invoke({"query": query, "context": context})
+            return qa_chain({"query": query})
         except httpx.HTTPStatusError as e:
             if "429" in str(e):  # Check if it's a rate limit error
                 if attempt < retries - 1:
@@ -118,49 +118,65 @@ def handle_rate_limit(chain, query, context, retries=3, delay=5):
 
 @app.post("/query")
 async def query_embeddings(request: QueryRequest):
-    # PGVector VectorStore
-    vectorstore = PGVector(
-        connection_string=DB_CONN_STRING,
-        collection_name="document_embeddings",
-        embedding_function=embedding_model
-    )
+    try:
+        # PGVector VectorStore
+        vectorstore = PGVector(
+            connection_string=DB_CONN_STRING,
+            collection_name="document_embeddings",
+            embedding_function=embedding_model
+        )
 
-    # Retriever
-    retriever = vectorstore.as_retriever(search_kwargs={"k": request.top_k})
+        # Retriever
+        retriever = vectorstore.as_retriever(search_kwargs={"k": request.top_k})
 
-    # Custom prompt
-    custom_prompt = ChatPromptTemplate.from_messages([
-        ("system", """You are an AI assistant that answers queries strictly based on the given documents.
-    - Only use the provided content to generate responses.
-    - Do not use external knowledge or speculate.
-    - If the provided text does not contain relevant information, respond only with:
-    'I do not have any information about the query.'
-    - Only if an answer is found, conclude with: (Source: doc_name, Page: page)
-    - Double check the answer before sending
+        # Custom prompt
+        custom_prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are an AI assistant that answers queries strictly based on the given documents.
+        - Only use the provided content to generate responses.
+        - Do not use external knowledge or speculate.
+        - If the provided text does not contain relevant information, respond only with: 'I do not have any information about the query.'
+        - Double check the answer before sending
 
-    Query: {question}
+        Query: {question}
 
-    Below is the relevant content extracted from documents:
-    {context}
-    """)
-    ])
+        Below is the relevant content extracted from documents:
+        {context}
+        """)
+        ])
 
-    # QA Chain
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        retriever=retriever,
-        chain_type="stuff",
-        chain_type_kwargs={"prompt": custom_prompt},
-        verbose=True,
-        return_source_documents=True
-    )
+        # QA Chain
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=llm,
+            retriever=retriever,
+            chain_type="stuff",
+            chain_type_kwargs={"prompt": custom_prompt},
+            verbose=True,
+            return_source_documents=True
+        )
 
-    result = qa_chain({"query": request.query})
-    
-    return {
-        "query": request.query,
-        "response": result["result"]
-    }
+        result = query_from_retrievalqa(qa_chain,request.query)
+
+        sources = []
+        seen = set()
+        for doc in result["source_documents"]:
+            meta = doc.metadata
+            key = (meta.get("doc_name"), meta.get("page"))
+            if key not in seen:
+                seen.add(key)
+                sources.append({
+                    "doc_name": key[0],
+                    "page": key[1]
+                })
+        
+        return {
+            "query": request.query,
+            "response": result["result"],
+            "sources":sources
+        }
+    except Exception as e:
+        return {
+            "error":str(e)
+        }
 
 if __name__ == "__main__":
     import uvicorn
